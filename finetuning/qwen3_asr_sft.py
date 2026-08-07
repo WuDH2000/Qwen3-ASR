@@ -24,7 +24,7 @@ import librosa
 import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
-from transformers import (GenerationConfig, Trainer, TrainerCallback,
+from transformers import (AutoConfig, GenerationConfig, Trainer, TrainerCallback,
                           TrainingArguments)
 
 
@@ -217,9 +217,15 @@ def parse_args():
     p.add_argument("--grad_acc", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--epochs", type=float, default=1)
+    p.add_argument("--max_steps", type=int, default=-1)
     p.add_argument("--log_steps", type=int, default=10)
     p.add_argument("--lr_scheduler_type", type=str, default="linear")
     p.add_argument("--warmup_ratio", type=float, default=0.02)
+    p.add_argument(
+        "--force_asr_lm_head",
+        action="store_true",
+        help="Load a forced-aligner checkpoint with a full ASR vocab lm_head for ASR SFT.",
+    )
 
     # DataLoader
     p.add_argument("--num_workers", type=int, default=4)
@@ -246,10 +252,22 @@ def main():
         raise ValueError("TRAIN_FILE is required (json/jsonl). Needs fields: audio, text, optional prompt")
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
+    model_kwargs = {
+        "dtype": torch.bfloat16 if use_bf16 else torch.float16,
+        "device_map": None,
+    }
+    if args_cli.force_asr_lm_head:
+        config = AutoConfig.from_pretrained(args_cli.model_path, trust_remote_code=True)
+        if not hasattr(config, "thinker_config"):
+            raise RuntimeError("--force_asr_lm_head requires a Qwen3-ASR style config with thinker_config")
+        config.thinker_config.model_type = "qwen3_asr"
+        config.thinker_config.text_config.tie_word_embeddings = True
+        model_kwargs["config"] = config
+        model_kwargs["ignore_mismatched_sizes"] = True
+
     asr_wrapper = Qwen3ASRModel.from_pretrained(
         args_cli.model_path,
-        dtype=torch.bfloat16 if use_bf16 else torch.float16,
-        device_map=None,
+        **model_kwargs,
     )
     model = asr_wrapper.model
     processor = asr_wrapper.processor
@@ -280,6 +298,7 @@ def main():
         gradient_accumulation_steps=args_cli.grad_acc,
         learning_rate=args_cli.lr,
         num_train_epochs=args_cli.epochs,
+        max_steps=args_cli.max_steps,
         logging_steps=args_cli.log_steps,
         lr_scheduler_type=args_cli.lr_scheduler_type,
         warmup_ratio=args_cli.warmup_ratio,
@@ -291,7 +310,7 @@ def main():
         save_steps=args_cli.save_steps,
         save_total_limit=args_cli.save_total_limit,
         save_safetensors=True,
-        eval_strategy="steps",
+        eval_strategy="steps" if args_cli.eval_file else "no",
         eval_steps=args_cli.save_steps,
         do_eval=bool(args_cli.eval_file),
         bf16=use_bf16,
